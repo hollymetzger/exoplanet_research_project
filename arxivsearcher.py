@@ -1,21 +1,20 @@
 import arxiv
 import pandas as pd
 import ads
+import sqlite3
+import api_keys
 
 #############################################################
 ########################## set up ###########################
 #############################################################
 
-MAX_RESULTS = 3
-
-ads.config.token = "B1zNcCGbdLDSYXEXWEmJkB6AFa1tpTFWGstwwSZZ"
+MAX_RESULTS = 999
 
 main_papers_df = pd.DataFrame() # stores the main list of papers
 # paper_id, title, authors, year, doi, url
 
 main_authors_df = pd.DataFrame()
 # author_id, author_name
-
 
 #############################################################
 ################## data scraping methods ####################
@@ -43,6 +42,36 @@ def queryArxiv(*queries):
             })
 
     return pd.DataFrame(papers)
+
+def fetch_ads_metadata(bibcodes, chunk_size=20):
+    papers = []
+
+    for i in range(0, len(bibcodes), chunk_size):
+        chunk = bibcodes[i:i+chunk_size]
+        query_string = "(" + " OR ".join(chunk) + ")"
+
+        results = list(ads.SearchQuery(
+            bibcode=query_string,
+            fl=["title", "year", "author", "doi"]
+        ))
+
+        for r in results:
+            papers.append({
+                "title": r.title[0] if r.title else None,
+                "authors": r.author if r.author else [],
+                "year": r.year,
+                "doi": r.doi[0] if r.doi else None,
+                "url": None
+            })
+
+    return pd.DataFrame(papers)
+
+
+
+
+#############################################################
+################## data handling methods ####################
+#############################################################
 
 # accepts df with authors column and returns an authors dataframe
 def createAuthorsDF(df):
@@ -87,6 +116,17 @@ def get_references(doi):
         return papers[0].reference
     return []
 
+# returns a list of a citations from a paper with the given doi
+def get_citations(doi):
+    papers = list(ads.SearchQuery(
+        doi=doi,
+        fl=["citation"]
+    ))
+    
+    if papers and hasattr(papers[0], "citation"):
+        return papers[0].citation
+    return []
+
 # accepts a df of papers with a "doi" col and returns a df of edges
 def createEdgesDF(papers_df):
     edges = []
@@ -104,20 +144,329 @@ def createEdgesDF(papers_df):
     return pd.DataFrame(edges)
 
 
-##### testing
+###########################################################
+##################### sqlite methods ######################
+###########################################################
 
-main_papers_df = queryArxiv('"ocean world"')
-main_authors_df = createAuthorsDF(main_papers_df)
-paper_authors = createPaperAuthorsDF(main_papers_df, main_authors_df)
-edges_df = createEdgesDF(main_papers_df)
+def insert_into_db(papers_df, conn):
+    cursor = conn.cursor()
 
-print("****************** Paper authors head")
-print(paper_authors.head())
-print("****************** Paper authors cols")
-print(paper_authors.columns)
-print("****************** Paper authors dtypes")
-print(paper_authors.dtypes)
+    #################################################
+    # 1. Create tables (if they don't exist)
+    #################################################
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS papers (
+        paper_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT UNIQUE,
+        year INTEGER,
+        doi TEXT,
+        url TEXT
+    )
+    """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS authors (
+        author_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        author_name TEXT UNIQUE
+    )
+    """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS paper_authors (
+        paper_id INTEGER,
+        author_id INTEGER,
+        UNIQUE(paper_id, author_id),
+        FOREIGN KEY(paper_id) REFERENCES papers(paper_id),
+        FOREIGN KEY(author_id) REFERENCES authors(author_id)
+    )
+    """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS citations (
+        source_paper_id INTEGER,
+        target_paper_id INTEGER,
+        UNIQUE(source_paper_id, target_paper_id),
+        FOREIGN KEY(source_paper_id) REFERENCES papers(paper_id),
+        FOREIGN KEY(target_paper_id) REFERENCES papers(paper_id)
+    )
+    """)
+
+    conn.commit()
+
+    #################################################
+    # 2. Insert papers
+    #################################################
+
+    for _, row in papers_df.iterrows():
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO papers (title, year, doi, url)
+                VALUES (?, ?, ?, ?)
+            """, (row["title"].upper(), row["year"], row["doi"], row["url"]))
+
+        except Exception as e:
+            print(f"Error inserting paper: {row['title']}")
+            print(e)
+
+    conn.commit()
+
+    #################################################
+    # 3. Insert authors + relationships
+    #################################################
+
+    for _, row in papers_df.iterrows():
+        doi = row["doi"]
+
+        # get paper_id from DB
+        cursor.execute("SELECT paper_id FROM papers WHERE doi IS ?", (doi,))
+        result = cursor.fetchone()
+
+        if not result:
+            continue
+
+        paper_id = result[0]
+
+        for author in row["authors"]:
+            try:
+                # insert author if new
+                cursor.execute("""
+                    INSERT OR IGNORE INTO authors (author_name)
+                    VALUES (?)
+                """, (author,))
+
+                # get author_id
+                cursor.execute("""
+                    SELECT author_id FROM authors WHERE author_name = ?
+                """, (author,))
+                author_id = cursor.fetchone()[0]
+
+                # link paper ↔ author
+                cursor.execute("""
+                    INSERT OR IGNORE INTO paper_authors (paper_id, author_id)
+                    VALUES (?, ?)
+                """, (paper_id, author_id))
+
+            except Exception as e:
+                print(f"Error linking author {author} to paper {doi}")
+                print(e)
+
+    conn.commit()
+
+    print("Database updated successfully.")
+
+def get_paper_id(cursor, doi, title):
+    if doi:
+        cursor.execute("SELECT paper_id FROM papers WHERE doi = ?", (doi,))
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+
+    # fallback to title
+    cursor.execute("SELECT paper_id FROM papers WHERE title = ?", (title,))
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+
+    return None
+
+def add_references_for_paper(doi, conn):
+    cursor = conn.cursor()
+
+    # get source paper (the one doing the citing)
+    cursor.execute("SELECT paper_id, title FROM papers WHERE doi = ?", (doi,))
+    source = cursor.fetchone()
+
+    if not source:
+        print(f"Paper with DOI {doi} not found in DB.")
+        return
+
+    source_paper_id, source_title = source
+
+    print(f"\nFetching references for:\n{source_title}\n")
+
+    bibcodes = get_references(doi)
+
+    if not bibcodes:
+        print("No references found.")
+        return
+
+    ref_df = fetch_ads_metadata(bibcodes)
+
+    # insert referenced papers
+    insert_into_db(ref_df, conn)
+
+    # create edges
+    for _, row in ref_df.iterrows():
+        target_id = get_paper_id(cursor, row["doi"], row["title"])
+
+        if target_id:
+            try:
+                # source → target
+                cursor.execute("""
+                    INSERT OR IGNORE INTO citations (source_paper_id, target_paper_id)
+                    VALUES (?, ?)
+                """, (source_paper_id, target_id))
+
+            except Exception as e:
+                print("Error inserting reference edge:", e)
+
+    conn.commit()
+
+    print(f"Added {len(ref_df)} reference edges.\n")
+
+def add_citations_for_paper(doi, conn):
+    cursor = conn.cursor()
+
+    # target paper (being cited)
+    cursor.execute("SELECT paper_id, title FROM papers WHERE doi = ?", (doi,))
+    target = cursor.fetchone()
+
+    if not target:
+        print(f"Paper with DOI {doi} not found in DB.")
+        return
+
+    target_paper_id, target_title = target
+
+    print(f"\nFetching forward citations for:\n{target_title}\n")
+
+    bibcodes = get_citations(doi)
+
+    if not bibcodes:
+        print("No citations found.")
+        return
+
+    citing_df = fetch_ads_metadata(bibcodes)
+
+    # insert citing papers
+    insert_into_db(citing_df, conn)
+
+    # create edges
+    for _, row in citing_df.iterrows():
+        source_id = get_paper_id(cursor, row["doi"], row["title"])
+
+        if source_id:
+            try:
+                # source → target
+                cursor.execute("""
+                    INSERT OR IGNORE INTO citations (source_paper_id, target_paper_id)
+                    VALUES (?, ?)
+                """, (source_id, target_paper_id))
+
+            except Exception as e:
+                print("Error inserting citation edge:", e)
+
+    conn.commit()
+
+    print(f"Added {len(citing_df)} citation edges.\n")
+
+def normalize_titles_and_deduplicate(db_path="exoplanets.db"):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    print("\nNormalizing titles and removing duplicates...\n")
+
+    #################################################
+    # 1. Normalize titles to uppercase
+    #################################################
+
+    cursor.execute("""
+        UPDATE papers
+        SET title = UPPER(title)
+    """)
+
+    conn.commit()
+
+    #################################################
+    # 2. Find duplicates (same title after normalization)
+    #################################################
+
+    cursor.execute("""
+        SELECT title, GROUP_CONCAT(paper_id)
+        FROM papers
+        GROUP BY title
+        HAVING COUNT(*) > 1
+    """)
+
+    duplicates = cursor.fetchall()
+
+    print(f"Found {len(duplicates)} duplicate title groups.\n")
+
+    #################################################
+    # 3. Merge duplicates
+    #################################################
+
+    for title, id_list_str in duplicates:
+        ids = list(map(int, id_list_str.split(",")))
+
+        # choose one to keep
+        keep_id = ids[0]
+        remove_ids = ids[1:]
+
+        print(f"Merging duplicates for title:\n{title}")
+        print(f"Keeping ID {keep_id}, removing {remove_ids}\n")
+
+        for rid in remove_ids:
+
+            # --- Update paper_authors ---
+            cursor.execute("""
+                UPDATE OR IGNORE paper_authors
+                SET paper_id = ?
+                WHERE paper_id = ?
+            """, (keep_id, rid))
+
+            # --- Update citations (source side) ---
+            cursor.execute("""
+                UPDATE OR IGNORE citations
+                SET source_paper_id = ?
+                WHERE source_paper_id = ?
+            """, (keep_id, rid))
+
+            # --- Update citations (target side) ---
+            cursor.execute("""
+                UPDATE OR IGNORE citations
+                SET target_paper_id = ?
+                WHERE target_paper_id = ?
+            """, (keep_id, rid))
+
+            # --- Delete duplicate paper ---
+            cursor.execute("""
+                DELETE FROM papers
+                WHERE paper_id = ?
+            """, (rid,))
+
+    conn.commit()
+
+    print("✅ Normalization and deduplication complete.\n")
+
+def expand_all_citations(conn):
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT doi FROM papers WHERE doi IS NOT NULL")
+    dois = [row[0] for row in cursor.fetchall()]
+
+    for doi in dois:
+        add_citations_for_paper(doi, conn)
+
+def getPaperIDsByTitleKeyword(conn, *keywords):
+    cursor = conn.cursor()
+    ids = []
+    for kw in keywords:
+        cursor.execute(f"""
+                        SELECT paper_id from papers where
+                        title like '%{kw}%';
+                        """)
+        ids = ids + cursor.fetchall()
+
+    # deduplicate the list if a title had more than one of the keywords in it
+    return list(set(ids))
+
+def initSQLiteConnection(db_path="exoplanets.db"):
+    return sqlite3.connect(db_path)
+
+def main():
+    conn = initSQLiteConnection()
+    getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
+    conn.close()
+
+main()

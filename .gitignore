@@ -1,5 +1,6 @@
-# csv files
+# csv and testing files
 *.csv
+testing.py
 
 # private api keys
 api_keys.py

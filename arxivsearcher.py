@@ -9,6 +9,7 @@ import api_keys
 #############################################################
 
 MAX_RESULTS = 999
+ads.config.token = "jRchfL7EEotCCYYDUAUKAFSEWihuFVEo00qownRF"
 
 main_papers_df = pd.DataFrame() # stores the main list of papers
 # paper_id, title, authors, year, doi, url
@@ -439,6 +440,82 @@ def normalize_titles_and_deduplicate(db_path="exoplanets.db"):
 
     print("✅ Normalization and deduplication complete.\n")
 
+def deduplicate_by_doi(db_path="exoplanets.db"):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    print("\nremoving duplicates...\n")
+
+    #################################################
+    # 1. Find duplicates
+    #################################################
+
+    cursor.execute("""
+        SELECT doi, GROUP_CONCAT(paper_id)
+        FROM papers
+        GROUP BY doi
+        HAVING COUNT(*) > 1
+    """)
+
+    duplicates = cursor.fetchall()
+
+    duplicates.pop(0)
+
+    print(f"Found {len(duplicates)} duplicate doi groups.\n")
+
+    for doi, id_list_str in duplicates:
+        ids = list(map(int, id_list_str.split(",")))
+        print(doi)
+        print(len(ids))
+
+    #################################################
+    # 3. Merge duplicates
+    #################################################
+
+    for doi, id_list_str in duplicates:
+        ids = list(map(int, id_list_str.split(",")))
+
+        # choose one to keep
+        keep_id = ids[0]
+        remove_ids = ids[1:]
+
+        print(f"Merging duplicates for title:\n{doi}")
+        print(f"Keeping ID {keep_id}, removing {remove_ids}\n")
+
+        for rid in remove_ids:
+
+            # --- Update paper_authors ---
+            cursor.execute("""
+                UPDATE OR IGNORE paper_authors
+                SET paper_id = ?
+                WHERE paper_id = ?
+            """, (keep_id, rid))
+
+            # --- Update citations (source side) ---
+            cursor.execute("""
+                UPDATE OR IGNORE citations
+                SET source_paper_id = ?
+                WHERE source_paper_id = ?
+            """, (keep_id, rid))
+
+            # --- Update citations (target side) ---
+            cursor.execute("""
+                UPDATE OR IGNORE citations
+                SET target_paper_id = ?
+                WHERE target_paper_id = ?
+            """, (keep_id, rid))
+
+            # --- Delete duplicate paper ---
+            cursor.execute("""
+                DELETE FROM papers
+                WHERE paper_id = ?
+            """, (rid,))
+
+    conn.commit()
+    conn.close()
+
+    print("✅ Normalization and deduplication complete.\n")
+
 def expand_all_citations(conn):
     cursor = conn.cursor()
 
@@ -466,7 +543,23 @@ def initSQLiteConnection(db_path="exoplanets.db"):
 
 def main():
     conn = initSQLiteConnection()
-    getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
+    cursor = conn.cursor()
+    ids = getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
+    for id in ids:
+        # get doi
+        cursor.execute("SELECT doi FROM papers WHERE paper_id IS ?", (id[0],))
+        doi = cursor.fetchone()[0]
+        print(doi)
+        cursor.execute("SELECT title FROM papers WHERE paper_id IS ?", (id[0],))
+        title = cursor.fetchone()[0]
+        print(title)
+
+        # add the references and citations for this paper
+        if doi:
+            add_references_for_paper(doi, conn)
+            add_citations_for_paper(doi, conn)
+        else:
+            print("error: no doi for paper: " + title)
     conn.close()
 
 main()

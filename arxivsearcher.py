@@ -9,7 +9,6 @@ import api_keys
 #############################################################
 
 MAX_RESULTS = 999
-ads.config.token = "jRchfL7EEotCCYYDUAUKAFSEWihuFVEo00qownRF"
 
 main_papers_df = pd.DataFrame() # stores the main list of papers
 # paper_id, title, authors, year, doi, url

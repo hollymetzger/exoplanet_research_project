@@ -8,7 +8,8 @@ import api_keys
 ########################## set up ###########################
 #############################################################
 
-MAX_RESULTS = 999
+MAX_RESULTS = 1
+DATABASE = "exoplanet_archive.db"
 
 main_papers_df = pd.DataFrame() # stores the main list of papers
 # paper_id, title, authors, year, doi, url
@@ -21,7 +22,7 @@ main_authors_df = pd.DataFrame()
 #############################################################
 
 # returns a pandas dataframe of paper metadata from arxiv
-def queryArxiv(*queries):
+def queryArxiv(*queries, MAX_RESULTS=1):
 
     papers = []
 
@@ -39,6 +40,31 @@ def queryArxiv(*queries):
                 "year": result.published.year,
                 "doi": result.doi or None,
                 "url": result.entry_id
+            })
+
+    return pd.DataFrame(papers)
+
+def queryADS(*queries, max_results=MAX_RESULTS):
+    papers = []
+
+    for query in queries:
+        results = ads.SearchQuery(
+            q=query,
+            fl=["title", "author", "year", "doi", "bibcode"],
+            rows=max_results,
+            sort="score desc"
+        )
+
+        for i, result in enumerate(results):
+            papers.append({
+                "paper_id": len(papers),
+                "title": result.title[0] if result.title else None,
+                "authors": result.author if result.author else [],
+                "year": int(result.year) if result.year else None,
+                "doi": result.doi[0] if result.doi else None,
+                "url": f"https://ui.adsabs.harvard.edu/abs/{result.bibcode}" if result.bibcode else None,
+                "bibcode": result.bibcode,
+                "abstract": result.abs
             })
 
     return pd.DataFrame(papers)
@@ -360,7 +386,7 @@ def add_citations_for_paper(doi, conn):
 
     print(f"Added {len(citing_df)} citation edges.\n")
 
-def normalize_titles_and_deduplicate(db_path="exoplanets.db"):
+def normalize_titles_and_deduplicate(db_path=DATABASE):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -439,7 +465,7 @@ def normalize_titles_and_deduplicate(db_path="exoplanets.db"):
 
     print("✅ Normalization and deduplication complete.\n")
 
-def deduplicate_by_doi(db_path="exoplanets.db"):
+def deduplicate_by_doi(db_path=DATABASE):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -537,7 +563,7 @@ def getPaperIDsByTitleKeyword(conn, *keywords):
     # deduplicate the list if a title had more than one of the keywords in it
     return list(set(ids))
 
-def initSQLiteConnection(db_path="exoplanets.db"):
+def initSQLiteConnection(db_path=DATABASE):
     return sqlite3.connect(db_path)
 
 def main():
@@ -561,4 +587,9 @@ def main():
             print("error: no doi for paper: " + title)
     conn.close()
 
-main()
+
+
+
+
+x = queryADS("hycean",1)
+print(x)

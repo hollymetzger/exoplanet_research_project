@@ -8,7 +8,7 @@ import api_keys
 ########################## set up ###########################
 #############################################################
 
-MAX_RESULTS = 1
+MAX_RESULTS = 3
 DATABASE = "exoplanet_archive.db"
 
 main_papers_df = pd.DataFrame() # stores the main list of papers
@@ -33,13 +33,15 @@ def queryArxiv(*queries, MAX_RESULTS=1):
             sort_by=arxiv.SortCriterion.Relevance
         )
         for result in search.results():
+            print(result)
             papers.append({
                 "paper_id": len(papers),
                 "title": result.title,
                 "authors": [a.name for a in result.authors],
                 "year": result.published.year,
                 "doi": result.doi or None,
-                "url": result.entry_id
+                "url": result.entry_id,
+                "abstract": result.summary
             })
 
     return pd.DataFrame(papers)
@@ -50,7 +52,7 @@ def queryADS(*queries, max_results=MAX_RESULTS):
     for query in queries:
         results = ads.SearchQuery(
             q=query,
-            fl=["title", "author", "year", "doi", "bibcode"],
+            fl=["title", "author", "year", "doi", "bibcode", "abstract"],
             rows=max_results,
             sort="score desc"
         )
@@ -64,7 +66,7 @@ def queryADS(*queries, max_results=MAX_RESULTS):
                 "doi": result.doi[0] if result.doi else None,
                 "url": f"https://ui.adsabs.harvard.edu/abs/{result.bibcode}" if result.bibcode else None,
                 "bibcode": result.bibcode,
-                "abstract": result.abs
+                "abstract": result.abstract
             })
 
     return pd.DataFrame(papers)
@@ -572,7 +574,8 @@ def main():
     ids = getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
     for id in ids:
         # get doi
-        cursor.execute("SELECT doi FROM papers WHERE paper_id IS ?", (id[0],))
+        cursor.execute(ids = getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
+    "SELECT doi FROM papers WHERE paper_id IS ?", (id[0],))
         doi = cursor.fetchone()[0]
         print(doi)
         cursor.execute("SELECT title FROM papers WHERE paper_id IS ?", (id[0],))
@@ -587,9 +590,4 @@ def main():
             print("error: no doi for paper: " + title)
     conn.close()
 
-
-
-
-
-x = queryADS("hycean",1)
-print(x)
+x = queryADS('"hycean" AND "analysis" OR "water world" AND "analysis"')

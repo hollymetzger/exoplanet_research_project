@@ -3,13 +3,14 @@ import pandas as pd
 import ads
 import sqlite3
 import api_keys
+import string
 
 #############################################################
 ########################## set up ###########################
 #############################################################
 
-MAX_RESULTS = 3
-DATABASE = "exoplanet_archive.db"
+MAX_RESULTS = 999
+DATABASE = "exoplanet_papers.db"
 
 main_papers_df = pd.DataFrame() # stores the main list of papers
 # paper_id, title, authors, year, doi, url
@@ -59,7 +60,6 @@ def queryADS(*queries, max_results=MAX_RESULTS):
 
         for i, result in enumerate(results):
             papers.append({
-                "paper_id": len(papers),
                 "title": result.title[0] if result.title else None,
                 "authors": result.author if result.author else [],
                 "year": int(result.year) if result.year else None,
@@ -71,6 +71,7 @@ def queryADS(*queries, max_results=MAX_RESULTS):
 
     return pd.DataFrame(papers)
 
+# accepts a list of bibcodes and returns a dataframe of them as papers
 def fetch_ads_metadata(bibcodes, chunk_size=20):
     papers = []
 
@@ -80,7 +81,7 @@ def fetch_ads_metadata(bibcodes, chunk_size=20):
 
         results = list(ads.SearchQuery(
             bibcode=query_string,
-            fl=["title", "year", "author", "doi"]
+            fl=["title", "year", "author", "doi", "bibcode", "abstract"]
         ))
 
         for r in results:
@@ -89,7 +90,9 @@ def fetch_ads_metadata(bibcodes, chunk_size=20):
                 "authors": r.author if r.author else [],
                 "year": r.year,
                 "doi": r.doi[0] if r.doi else None,
-                "url": None
+                "url": f"https://ui.adsabs.harvard.edu/abs/{r.bibcode}" if r.bibcode else None,
+                "bibcode": r.bibcode,
+                "abstract": r.abstract
             })
 
     return pd.DataFrame(papers)
@@ -144,7 +147,7 @@ def get_references(doi):
         return papers[0].reference
     return []
 
-# returns a list of a citations from a paper with the given doi
+# returns a list of bibcodes of citations from a paper with the given doi
 def get_citations(doi):
     papers = list(ads.SearchQuery(
         doi=doi,
@@ -189,7 +192,9 @@ def insert_into_db(papers_df, conn):
         title TEXT UNIQUE,
         year INTEGER,
         doi TEXT,
-        url TEXT
+        url TEXT,
+        bibcode TEXT,
+        abstract TEXT
     )
     """)
 
@@ -229,10 +234,11 @@ def insert_into_db(papers_df, conn):
     for _, row in papers_df.iterrows():
         try:
             cursor.execute("""
-                INSERT OR IGNORE INTO papers (title, year, doi, url)
-                VALUES (?, ?, ?, ?)
-            """, (row["title"].upper(), row["year"], row["doi"], row["url"]))
-
+                INSERT OR IGNORE INTO papers (title, year, doi, url, bibcode, abstract)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (cleanString(row["title"]), row["year"], row["doi"], row["url"], row["bibcode"], row["abstract"]))
+            if cursor.rowcount == 1:
+                print(f"Inserted '{row['title']}' into {DATABASE}")
         except Exception as e:
             print(f"Error inserting paper: {row['title']}")
             print(e)
@@ -486,9 +492,13 @@ def deduplicate_by_doi(db_path=DATABASE):
 
     duplicates = cursor.fetchall()
 
+    print(f"Found {len(duplicates)} duplicate doi groups.\n")
+
+    if (len(duplicates) == 0):
+        return
+
     duplicates.pop(0)
 
-    print(f"Found {len(duplicates)} duplicate doi groups.\n")
 
     for doi, id_list_str in duplicates:
         ids = list(map(int, id_list_str.split(",")))
@@ -568,26 +578,39 @@ def getPaperIDsByTitleKeyword(conn, *keywords):
 def initSQLiteConnection(db_path=DATABASE):
     return sqlite3.connect(db_path)
 
-def main():
-    conn = initSQLiteConnection()
-    cursor = conn.cursor()
-    ids = getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
-    for id in ids:
-        # get doi
-        cursor.execute(ids = getPaperIDsByTitleKeyword(conn, "water world", "water-world", "ocean planet")
-    "SELECT doi FROM papers WHERE paper_id IS ?", (id[0],))
-        doi = cursor.fetchone()[0]
-        print(doi)
-        cursor.execute("SELECT title FROM papers WHERE paper_id IS ?", (id[0],))
-        title = cursor.fetchone()[0]
-        print(title)
+def cleanString(text):
+    return text.translate(str.maketrans('', '', string.punctuation)).upper()
 
-        # add the references and citations for this paper
-        if doi:
-            add_references_for_paper(doi, conn)
-            add_citations_for_paper(doi, conn)
-        else:
-            print("error: no doi for paper: " + title)
+def getDOIs(conn):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT doi FROM papers;
+    """)
+
+    return cursor.fetchall()
+
+def main1():
+    x = queryADS('hycean AND analysis OR "water world" AND analysis OR "ocean planet" AND analysis', max_results=999)
+    conn = initSQLiteConnection()
+    insert_into_db(x, conn)
     conn.close()
 
-x = queryADS('"hycean" AND "analysis" OR "water world" AND "analysis"')
+def main():
+    conn = initSQLiteConnection()
+
+    # do initial search for key papers
+    x = queryADS('hycean AND analysis OR "water world" AND analysis OR "ocean planet" AND analysis', max_results=10)
+    insert_into_db(x, conn)
+    normalize_titles_and_deduplicate()
+    deduplicate_by_doi()
+
+    return
+
+    # get citations for each of the papers
+    dois = getDOIs(conn)
+
+    for doi in dois:
+        add_citations_for_paper(doi, conn)
+    
+
+main()

@@ -10,6 +10,7 @@ Research paper exploring the relationship between magnetic fields and exoplanet 
 
 ## Skills Demonstrated
 - Scientific research
+- Data Science
 - Technical writing
 - Literature synthesis
 - Science communication
